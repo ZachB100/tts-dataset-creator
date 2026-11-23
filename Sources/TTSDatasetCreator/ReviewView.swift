@@ -1,7 +1,7 @@
 import SwiftUI
 import TTSKit
 
-/// Review table for one file plus the waveform editor for the selected segment.
+/// Review table for one file, with a play bar for the selected segment.
 struct ReviewView: View {
     @EnvironmentObject var model: AppModel
     @ObservedObject var job: FileJob
@@ -14,48 +14,36 @@ struct ReviewView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            editor
-                .frame(height: 230)
+            segmentBar
             Divider()
             table
         }
         .onDisappear { player.stop() }
     }
 
-    @ViewBuilder private var editor: some View {
-        if let id = selectedID, let audio = job.audio, let binding = model.binding(job: job, segment: id),
-           let idx = job.segments.firstIndex(where: { $0.id == id }) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("Segment \(idx + 1)").font(.headline)
-                    Text(String(format: "%.2f – %.2f s  (%.2f s)", binding.wrappedValue.start, binding.wrappedValue.end,
-                                binding.wrappedValue.duration))
-                        .monospacedDigit().foregroundStyle(.secondary)
-                    Spacer()
-                    Button {
-                        player.toggle(id, audio: audio, start: binding.wrappedValue.start, end: binding.wrappedValue.end)
-                    } label: {
-                        Label(player.playingID == id ? "Stop" : "Play", systemImage: player.playingID == id ? "stop.fill" : "play.fill")
-                    }
-                    .keyboardShortcut(.space, modifiers: [])
+    @ViewBuilder private var segmentBar: some View {
+        HStack {
+            if let id = selectedID, let audio = job.audio, let idx = job.segments.firstIndex(where: { $0.id == id }) {
+                let seg = job.segments[idx]
+                Text("Segment \(idx + 1)").font(.headline)
+                Text(String(format: "%.2f – %.2f s  (%.2f s)", seg.start, seg.end, seg.duration))
+                    .monospacedDigit().foregroundStyle(.secondary)
+                    .accessibilityLabel(String(format: "Segment start %.2f seconds, segment end %.2f seconds, total length %.2f seconds",
+                                                      seg.start, seg.end, seg.duration))
+                Spacer()
+                Button {
+                    player.toggle(id, audio: audio, start: seg.start, end: seg.end)
+                } label: {
+                    Label(player.playingID == id ? "Stop" : "Play", systemImage: player.playingID == id ? "stop.fill" : "play.fill")
                 }
-                WaveformEditor(audio: audio, segment: binding,
-                               lowerLimit: idx > 0 ? job.segments[idx - 1].end : 0,
-                               upperLimit: idx + 1 < job.segments.count ? job.segments[idx + 1].start : audio.duration,
-                               thresholdDb: job.analysis?.silenceThresholdDb ?? -60) {
-                    model.boundsOrNormalizedEdited(job: job, id: id)
-                }
-                Text("Drag the handles to move the start and end. Cuts should sit in silence.")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            .padding(10)
-        } else {
-            VStack {
-                Text(selection.value.count > 1 ? "\(selection.value.count) segments selected" : "Select a segment to see its waveform")
+                .keyboardShortcut(.space, modifiers: [])
+            } else {
+                Text(selection.value.count > 1 ? "\(selection.value.count) segments selected" : "Select a segment to play it")
                     .foregroundStyle(.secondary)
+                Spacer()
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .padding(10)
     }
 
     private var table: some View {
