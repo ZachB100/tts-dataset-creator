@@ -48,12 +48,13 @@ std::string hashFile(const std::string& path);
 
 class TTSDC_IMMORTAL_REFERENCE Engine {
 public:
-    /// Loads the Whisper and Silero models. Returns null on failure (see lastCreateError()).
-    static Engine* create(const std::string& whisperModelPath, const std::string& vadModelPath);
+    /// Loads the ASR model (`asrModelId`: "whisper-large-v3-turbo", "parakeet-tdt-0.6b-v2" or
+    /// "parakeet-tdt-0.6b-v3") and Silero VAD. Returns null on failure (see lastCreateError()).
+    static Engine* create(const std::string& asrModelId, const std::string& asrModelPath, const std::string& vadModelPath);
     static std::string lastCreateError();
     static void destroy(Engine* e);
 
-    /// Blocking: VAD -> chunked Whisper transcription (cached per chunk) -> cutting -> normalization.
+    /// Blocking: VAD -> chunked ASR transcription (cached per chunk) -> cutting -> normalization.
     /// `cacheDir` holds <hash>.json; a crash or cancel resumes from the last finished chunk.
     FileResult processFile(const std::string& audioPath, const float* pcm16k, size_t n, const std::string& cacheDir,
                            const CutOptions& cut, bool lowercaseAll);
@@ -64,6 +65,8 @@ public:
     int stage() const { return stage_.load(); }
 
     std::string modelName() const;
+    std::string modelId() const;
+    std::string modelLicense() const;
 
     /// Pronunciation dictionary used for normalization and sentence splitting.
     bool loadDictionaryFile(const std::string& path, std::string& error);
@@ -80,6 +83,8 @@ public:
 
 private:
     Engine() = default;
+    FileResult processFileImpl(const std::string& audioPath, const float* pcm16k, size_t n,
+                               const std::string& cacheDir, const CutOptions& cut, bool lowercaseAll);
     std::unique_ptr<AsrBackend> asr_;
     std::unique_ptr<SileroVad> vad_;
     PronunciationDictionary dict_;

@@ -120,8 +120,11 @@ public final class CoreEngine: @unchecked Sendable {
     private let engine: ttsdc.Engine
     private let lock = NSLock()
 
-    public init(whisperModel: URL, vadModel: URL) throws {
-        guard let e = ttsdc.Engine.create((whisperModel.path).cxx, (vadModel.path).cxx) else {
+    public let asrModel: AsrModel
+
+    public init(asr: AsrModel, asrModelFile: URL, vadModel: URL) throws {
+        asrModel = asr
+        guard let e = ttsdc.Engine.create((asr.id).cxx, (asrModelFile.path).cxx, (vadModel.path).cxx) else {
             throw EngineError.load(String(cxx: ttsdc.Engine.lastCreateError()))
         }
         engine = e
@@ -132,6 +135,8 @@ public final class CoreEngine: @unchecked Sendable {
     deinit { ttsdc.Engine.destroy(engine) }
 
     public var modelName: String { String(cxx: engine.modelName()) }
+    public var modelId: String { String(cxx: engine.modelId()) }
+    public var modelLicense: String { String(cxx: engine.modelLicense()) }
     public var progress: Double { engine.progress() }
     public var stage: ProcessingStage { ProcessingStage(rawValue: Int(engine.stage())) ?? .idle }
     public func cancel() { engine.requestCancel() }
@@ -219,6 +224,7 @@ public struct ExportResult: Sendable {
 public enum DatasetExporter {
     /// Write an LJSpeech folder (wavs/, metadata.csv, dataset_info.json). Blocking.
     public static func export(_ inputs: [ExportInput], to dir: URL, settings: ExportSettings, modelName: String,
+                              modelId: String = "", modelLicense: String = "",
                               padding: Double = 0.15) throws -> ExportResult {
         var o = ttsdc.ExportOptions()
         o.sampleRate = Int32(settings.sampleRate)
@@ -228,6 +234,8 @@ public enum DatasetExporter {
         o.minSeconds = settings.minSeconds
         o.maxSeconds = settings.maxSeconds
         o.modelName = (modelName).cxx
+        o.modelId = (modelId).cxx
+        o.modelLicense = (modelLicense).cxx
         o.appVersion = (appVersion).cxx
         var err = std.string()
         guard let ex = ttsdc.Exporter.create((dir.path).cxx, o, &err) else { throw EngineError.failed(String(cxx: err)) }

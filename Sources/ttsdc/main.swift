@@ -15,6 +15,22 @@ final class Flag: @unchecked Sendable {
     }
 }
 
+/// Monotonic counter for download progress lines.
+final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var v = -1
+    /// True when `n` is greater than the last value seen.
+    func advance(to n: Int) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if n > v { v = n; return true }
+        return false
+    }
+}
+
+final class ErrorBox: @unchecked Sendable {
+    var error: Error?
+}
+
 func usage() -> Never {
     print("""
     usage: ttsdc -o OUT_DIR [options] AUDIO...
@@ -29,6 +45,11 @@ func usage() -> Never {
       --lowercase          lowercase all normalized text
       --min S / --max S    length limits in seconds for flagging (default 1 / 15)
       --padding S          silence kept around speech, 0.10–0.20 (default 0.15)
+      --model ID           transcription model (default whisper-large-v3-turbo):
+                             whisper-large-v3-turbo   Whisper large-v3-turbo, DTW timestamps (MIT)
+                             parakeet-tdt-0.6b-v2     NVIDIA Parakeet TDT 0.6B v2, English (CC-BY-4.0)
+                             parakeet-tdt-0.6b-v3     NVIDIA Parakeet TDT 0.6B v3, multilingual (CC-BY-4.0)
+      --download           download missing model files from Hugging Face first
       --models DIR         model folder (default ~/Library/Application Support/TTSDatasetCreator/models)
       --keep-cache         don't clear the transcript cache after export
       --report FILE        write a TSV of every segment with its flags and cut levels
@@ -43,6 +64,8 @@ var cut = CutSettings()
 var modelsDir = AppPaths.models
 var keepCache = false
 var reportPath: URL?
+var asr = AsrModel.default
+var download = false
 var inputs: [URL] = []
 
 func value(_ i: inout Int) -> String {
@@ -64,6 +87,14 @@ while i < args.count {
     case "--max": cut.maxSeconds = Double(value(&i)) ?? 15
     case "--padding": cut.paddingSeconds = Double(value(&i)) ?? 0.15
     case "--models": modelsDir = URL(fileURLWithPath: value(&i))
+    case "--model":
+        let id = value(&i)
+        guard let m = AsrModel.find(id) else {
+            print("unknown --model \(id); choose one of: \(AsrModel.all.map(\.id).joined(separator: ", "))")
+            exit(2)
+        }
+        asr = m
+    case "--download": download = true
     case "--keep-cache": keepCache = true
     case "--report": reportPath = URL(fileURLWithPath: value(&i))
     case "-h", "--help": usage()
@@ -81,16 +112,40 @@ guard ExportSettings.sampleRates.contains(exportSettings.sampleRate) else {
 exportSettings.minSeconds = cut.minSeconds
 exportSettings.maxSeconds = cut.maxSeconds
 
-let whisperURL = modelsDir.appendingPathComponent(ModelSpec.whisper.fileName)
+if download {
+    guard modelsDir.standardizedFileURL == AppPaths.models.standardizedFileURL else {
+        print("--download only writes to the default model folder; drop --models")
+        exit(2)
+    }
+    for spec in ModelSpec.required(for: asr) where !spec.isInstalled {
+        print("downloading \(spec.label) from \(spec.url.host ?? "")…")
+        let done = DispatchSemaphore(value: 0)
+        let decile = Counter()
+        let d = ModelDownloader(spec: spec) { p in
+            if decile.advance(to: Int(p * 10)) { print(String(format: "  %3.0f%%", p * 100)) }
+        }
+        let failure = ErrorBox()
+        Task {
+            do { try await d.run() } catch { failure.error = error }
+            done.signal()
+        }
+        done.wait()
+        if let e = failure.error { print("download failed: \(e.localizedDescription)"); exit(1) }
+        print("  saved \(spec.localURL.path)")
+    }
+}
+
+print("ASR model: \(asr.name). Licence: \(asr.license)")
+let asrURL = modelsDir.appendingPathComponent(asr.spec.fileName)
 let vadURL = modelsDir.appendingPathComponent(ModelSpec.silero.fileName)
-for m in [whisperURL, vadURL] where !FileManager.default.fileExists(atPath: m.path) {
-    print("missing model \(m.path) — open the app once to download it, or fetch it from Hugging Face")
+for m in [asrURL, vadURL] where !FileManager.default.fileExists(atPath: m.path) {
+    print("missing model \(m.path) — re-run with --download, or open the app once to download it")
     exit(1)
 }
 
 let t0 = Date()
 var engineRef: CoreEngine?
-do { engineRef = try CoreEngine(whisperModel: whisperURL, vadModel: vadURL) } catch {
+do { engineRef = try CoreEngine(asr: asr, asrModelFile: asrURL, vadModel: vadURL) } catch {
     print(error.localizedDescription)
     exit(1)
 }
@@ -169,7 +224,8 @@ for url in inputs {
 }
 
 do {
-    let r = try DatasetExporter.export(exportInputs, to: outDir, settings: exportSettings, modelName: engine.modelName)
+    let r = try DatasetExporter.export(exportInputs, to: outDir, settings: exportSettings, modelName: engine.modelName,
+                                       modelId: engine.modelId, modelLicense: engine.modelLicense)
     print(String(format: "exported %d segments (%.1f min), skipped %d → %@", r.written, r.totalSeconds / 60, r.skipped,
                  outDir.path))
 } catch {

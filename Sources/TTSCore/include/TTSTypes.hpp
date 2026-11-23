@@ -74,6 +74,8 @@ struct ExportOptions {
     double maxSeconds = 15.0;
     double fadeSeconds = 0.010;
     std::string modelName;       ///< recorded in dataset_info.json
+    std::string modelId;         ///< short ASR model id, recorded in dataset_info.json
+    std::string modelLicense;    ///< ASR weights licence, recorded in dataset_info.json
     std::string appVersion;
 };
 

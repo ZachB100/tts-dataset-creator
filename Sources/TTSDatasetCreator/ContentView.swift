@@ -31,6 +31,8 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItemGroup {
+                SettingsLink { Label(model.asrModel.name, systemImage: "waveform.badge.mic") }
+                    .help("Transcription model: \(model.asrModel.name). Change it in Settings.")
                 Button { showImporter.value = true } label: { Label("Add Files", systemImage: "plus") }
                     .help("Add audio files to the queue")
                 Button { showDictionary.value = true } label: { Label("Pronunciations", systemImage: "character.book.closed") }

@@ -52,6 +52,8 @@ final class FileJob: ObservableObject, Identifiable, @unchecked Sendable { // on
     var audio: DecodedAudio?
     var analysis: FileAnalysisBox?
     var cacheKey: String?
+    /// ASR model that produced `segments` (recorded in dataset_info.json).
+    var asrModelName = "", asrModelId = "", asrModelLicense = ""
 
     init(url: URL) { self.url = url }
     var name: String { url.lastPathComponent }
@@ -77,6 +79,8 @@ final class AppModel: ObservableObject {
     @Published var export = ExportSettings()
     @Published var exportMessage: String?
     @Published var isExporting = false
+    /// Transcription backend/model; Whisper turbo unless the user picks another in Settings.
+    @Published private(set) var asrModel: AsrModel = .default
 
     private(set) var engine: CoreEngine?
     private var runner: Task<Void, Never>?
@@ -90,15 +94,32 @@ final class AppModel: ObservableObject {
 
     // MARK: models
 
+    var requiredModels: [ModelSpec] { ModelSpec.required(for: asrModel) }
+
     func checkModels() {
-        if ModelSpec.all.allSatisfy(\.isInstalled) { loadEngine() } else { modelState = .missing }
+        if requiredModels.allSatisfy(\.isInstalled) { loadEngine() } else { modelState = .missing }
+    }
+
+    /// True while a file is being decoded or transcribed (the model can't be switched then).
+    var isProcessing: Bool { jobs.contains { $0.status.isActive } }
+
+    /// Switch the transcription model. Files already transcribed keep their text; new files use the new model.
+    func selectAsrModel(_ m: AsrModel) {
+        guard m != asrModel, !isProcessing, modelState != .downloading else { return }
+        asrModel = m
+        UserDefaults.standard.set(m.id, forKey: "asrModel")
+        runner?.cancel()
+        runner = nil
+        engine = nil // free the old model before loading the next one
+        checkModels()
     }
 
     func downloadModels() {
         modelState = .downloading
+        let specs = requiredModels
         Task {
             do {
-                for spec in ModelSpec.all where !spec.isInstalled {
+                for spec in specs where !spec.isInstalled {
                     downloadProgress[spec.id] = 0
                     let d = ModelDownloader(spec: spec) { p in
                         Task { @MainActor in self.downloadProgress[spec.id] = p }
@@ -122,11 +143,12 @@ final class AppModel: ObservableObject {
 
     private func loadEngine() {
         modelState = .loading
-        let w = ModelSpec.whisper.localURL, v = ModelSpec.silero.localURL
+        let asr = asrModel, w = asr.spec.localURL, v = ModelSpec.silero.localURL
         Task.detached(priority: .userInitiated) {
             do {
-                let e = try CoreEngine(whisperModel: w, vadModel: v)
+                let e = try CoreEngine(asr: asr, asrModelFile: w, vadModel: v)
                 await MainActor.run {
+                    guard self.asrModel == asr else { return } // switched again while loading
                     self.engine = e
                     self.modelState = .ready
                     self.startQueue()
@@ -218,6 +240,9 @@ final class AppModel: ObservableObject {
             audio.releaseASRCopy()
             job.analysis = result.analysis
             job.cacheKey = result.cacheKey
+            job.asrModelName = engine.modelName
+            job.asrModelId = engine.modelId
+            job.asrModelLicense = engine.modelLicense
             job.segments = result.segments
             job.status = .done
         } catch EngineError.cancelled {
@@ -273,7 +298,6 @@ final class AppModel: ObservableObject {
     var readyJobs: [FileJob] { jobs.filter { $0.status == .done } }
 
     func runExport(to dir: URL) {
-        guard let engine else { return }
         let settings = export
         let inputs: [ExportInput] = readyJobs.compactMap { job in
             guard let audio = job.audio else { return nil }
@@ -287,11 +311,18 @@ final class AppModel: ObservableObject {
         let keys = readyJobs.compactMap(\.cacheKey)
         isExporting = true
         exportMessage = nil
-        let modelName = engine.modelName
+        // normally one model; if files were transcribed with different models, record them all
+        func joined(_ k: KeyPath<FileJob, String>) -> String {
+            var seen: [String] = []
+            for j in readyJobs where !j[keyPath: k].isEmpty && !seen.contains(j[keyPath: k]) { seen.append(j[keyPath: k]) }
+            return seen.joined(separator: "; ")
+        }
+        let modelName = joined(\.asrModelName), modelId = joined(\.asrModelId), modelLicense = joined(\.asrModelLicense)
         saveSettings()
         Task.detached(priority: .userInitiated) {
             do {
-                let r = try DatasetExporter.export(inputs, to: dir, settings: settings, modelName: modelName)
+                let r = try DatasetExporter.export(inputs, to: dir, settings: settings, modelName: modelName,
+                                                   modelId: modelId, modelLicense: modelLicense)
                 keys.forEach { CoreEngine.clearCache(key: $0) } // a successful export ends the run
                 await MainActor.run {
                     self.isExporting = false
@@ -312,6 +343,7 @@ final class AppModel: ObservableObject {
 
     private func loadSettings() {
         let d = UserDefaults.standard
+        if let id = d.string(forKey: "asrModel"), let m = AsrModel.find(id) { asrModel = m }
         if d.object(forKey: "minSeconds") != nil { cut.minSeconds = d.double(forKey: "minSeconds") }
         if d.object(forKey: "maxSeconds") != nil { cut.maxSeconds = d.double(forKey: "maxSeconds") }
         if d.object(forKey: "sampleRate") != nil { export.sampleRate = d.integer(forKey: "sampleRate") }

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "ASR.hpp"
 #include "DSP.hpp"
 #include "Engine.hpp"
 #include "Flags.hpp"
@@ -372,6 +373,92 @@ TEST(cutsLandInSilence) {
     CHECK(segs[2].end <= 9.0);
 }
 
+TEST(parakeetStyleEndsLandInSilence) {
+    // Worst case for Parakeet TDT: the sentence-final "." carries the last spoken token's end, quantized to 80 ms
+    // frames, so it can sit at (or a frame before) the speech offset instead of inside the pause.
+    auto s = synth({{0.5, 2.5}, {3.2, 5.0}, {5.8, 8.0}}, 9.0);
+    std::vector<Word> w;
+    auto add = [&](const char* t, double a, double b) { w.push_back({t, a, b, 0.9f}); };
+    add("Hello", 0.48, 0.88); add("there", 0.96, 1.52); add("my", 1.60, 1.92); add("friend.", 2.00, 2.48);
+    add("How", 3.20, 3.52); add("are", 3.60, 4.00); add("you", 4.08, 4.48); add("today?", 4.56, 5.04);
+    add("Fine", 5.84, 6.48); add("thanks", 6.56, 7.20); add("a", 7.28, 7.52); add("lot.", 7.60, 7.92);
+    FileAnalysis an = analyzeAudio(s.pcm.data(), s.pcm.size(), s.speech);
+    auto segs = cutSegments(w, an, CutOptions(), dict());
+    CHECK_EQ(segs.size(), size_t(3));
+    if (segs.size() != 3) return;
+    for (auto& g : segs) {
+        CHECK(g.startCutDb < an.silenceThresholdDb);
+        CHECK(g.endCutDb < an.silenceThresholdDb);
+        for (auto& f : g.flags) CHECK(f != std::string(flag::nonSilentCut) && f != std::string(flag::noGap));
+    }
+    CHECK(std::abs(segs[0].end - 2.65) < 0.03); // padding is measured from the real speech offset
+    CHECK(segs[0].end <= segs[1].start);
+    CHECK(segs[1].end <= segs[2].start);
+    CHECK_EQ(segs[2].raw, "Fine thanks a lot.");
+}
+
+TEST(tokenGrouping) {
+    // pieces as libparakeet decodes them: word starts carry a leading space
+    std::vector<AsrToken> t = {{" And", 0.24, 0.56, 1}, {" so", 0.56, 0.88, 1},   {",", 0.88, 0.88, 0.8f},
+                               {" f", 1.28, 1.36, 1},   {"ell", 1.36, 1.52, 1},   {"ow", 1.52, 1.76, 1},
+                               {" U", 1.80, 1.90, 1},   {".", 1.90, 1.90, 1},     {"S", 1.90, 2.00, 1},
+                               {".", 2.00, 2.00, 1},    {" Yes", 2.40, 2.70, 1},  {" ?", 2.70, 2.70, 0.5f}, {" ", 2.70, 2.70, 1},
+                               {"", 2.70, 2.70, 1}};
+    auto w = groupTokensIntoWords(t);
+    CHECK_EQ(w.size(), size_t(5));
+    if (w.size() != 5) return;
+    CHECK_EQ(w[0].text, "And");
+    CHECK_EQ(w[1].text, "so,");
+    CHECK(std::abs(w[1].end - 0.88) < 1e-9);
+    CHECK_EQ(w[2].text, "fellow");
+    CHECK(std::abs(w[2].start - 1.28) < 1e-9 && std::abs(w[2].end - 1.76) < 1e-9);
+    CHECK_EQ(w[3].text, "U.S.");
+    CHECK_EQ(w[4].text, "Yes?"); // a spaced punctuation piece attaches without its space
+    CHECK(std::abs(w[4].prob - 0.75f) < 1e-6);
+    auto spans = splitSentences(w, dict());
+    CHECK_EQ(spans.size(), size_t(2)); // "U.S." is an abbreviation, not a sentence end
+    CHECK(groupTokensIntoWords({}).empty());
+    CHECK(groupTokensIntoWords({{" ", 0, 0, 1}, {" ", 0, 0, 1}}).empty());
+    auto w2 = groupTokensIntoWords({{" New", 0, 0.2f, 1}, {" ", 0.2, 0.2, 1}, {"York", 0.2, 0.5, 1}});
+    CHECK_EQ(w2.size(), size_t(2)); // a bare boundary piece splits words
+}
+
+TEST(asrBackendFactory) {
+    std::string err;
+    CHECK(makeAsrBackend("no-such-model", "/nonexistent", err) == nullptr);
+    CHECK(err.find("unknown ASR model") != std::string::npos);
+    err.clear();
+    setWhisperLogging(false);
+    CHECK(makeAsrBackend(kParakeetV2Id, "/nonexistent/ggml-parakeet.bin", err) == nullptr);
+    CHECK(err.find("Parakeet") != std::string::npos);
+    CHECK(Engine::create(kParakeetV3Id, "/nonexistent/p.bin", "/nonexistent/vad.bin") == nullptr);
+}
+
+// Optional: real models. Set TTSDC_MODELS to the model folder to run (skipped otherwise).
+TEST(parakeetModelLoads) {
+    const char* dir = getenv("TTSDC_MODELS");
+    if (!dir) return;
+    std::string path = std::string(dir) + "/ggml-parakeet-tdt-0.6b-v2-f16.bin";
+    if (!std::filesystem::exists(path)) return;
+    std::string err;
+    auto b = makeAsrBackend(kParakeetV2Id, path, err);
+    CHECK(b != nullptr);
+    if (!b) return;
+    CHECK_EQ(b->modelId(), std::string(kParakeetV2Id));
+    CHECK(b->cacheTag() != std::string("turbo-dtw-v1"));
+    CHECK(b->modelLicense().find("CC-BY-4.0") != std::string::npos);
+    // 2 s of near-silence: must not fail, and cancel must abort
+    std::vector<float> pcm(32000, 0.0f);
+    std::vector<Word> w;
+    double lastP = -1;
+    CHECK(b->transcribe(pcm.data(), pcm.size(), 10.0, "", w, [&](double p) { lastP = p; }, [] { return false; }, err));
+    CHECK(lastP == 1.0);
+    for (auto& x : w) CHECK(x.start >= 10.0);
+    w.clear();
+    CHECK(!b->transcribe(pcm.data(), pcm.size(), 0, "", w, nullptr, [] { return true; }, err));
+    CHECK_EQ(err, "cancelled");
+}
+
 TEST(trimLongSilence) {
     // a 4 s pause between sentences must not end up inside the segments
     auto s = synth({{0.5, 2.0}, {6.0, 8.0}}, 9.0);
@@ -475,6 +562,8 @@ TEST(exportLJSpeech) {
         o.threeColumns = three;
         o.dropFlagged = !three;
         o.modelName = "test-model";
+        o.modelId = "parakeet-tdt-0.6b-v2";
+        o.modelLicense = "CC-BY-4.0 (NVIDIA)";
         std::string err;
         Exporter* e = Exporter::create(dir.string(), o, err);
         CHECK(e != nullptr);
@@ -503,6 +592,12 @@ TEST(exportLJSpeech) {
         CHECK(std::abs(wav.front()) < 0.01f); // faded in
         CHECK(std::abs(wav.back()) < 0.01f);  // faded out
         CHECK(fs::exists(dir / "dataset_info.json"));
+        {
+            std::ifstream fi(dir / "dataset_info.json");
+            std::string info((std::istreambuf_iterator<char>(fi)), std::istreambuf_iterator<char>());
+            CHECK(info.find("\"asr_model_id\": \"parakeet-tdt-0.6b-v2\"") != std::string::npos);
+            CHECK(info.find("\"asr_model_license\": \"CC-BY-4.0 (NVIDIA)\"") != std::string::npos);
+        }
         fs::remove_all(dir);
     }
     CHECK_EQ(sanitizeId("a b/c.wav"), "c");

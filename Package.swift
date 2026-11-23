@@ -19,7 +19,7 @@ let package = Package(
         .executable(name: "ttsdc", targets: ["ttsdc"]),
     ],
     targets: [
-        // C++ core: normalization, cutting, ASR/VAD wrappers, export.
+        // C++ core: normalization, cutting, ASR (Whisper turbo, NVIDIA Parakeet)/VAD wrappers, export.
         .target(
             name: "TTSCore",
             exclude: ["vendor"],
@@ -31,6 +31,7 @@ let package = Package(
             linkerSettings: [
                 .unsafeFlags(["-L\(whisperLib)"]),
                 .linkedLibrary("whisper"),
+                .linkedLibrary("parakeet"),
                 .linkedLibrary("ggml"),
                 .linkedLibrary("ggml-base"),
                 .linkedLibrary("ggml-cpu"),

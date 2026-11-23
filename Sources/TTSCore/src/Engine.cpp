@@ -23,8 +23,6 @@ namespace ttsdc {
 namespace {
 
 std::string gCreateError;
-constexpr const char* kCacheVersion = "turbo-dtw-v1";
-constexpr double kChunkTarget = 300.0; // seconds per cached chunk
 
 void mergeFlags(std::vector<std::string>& into, const std::vector<std::string>& add) {
     for (auto& f : add)
@@ -50,13 +48,14 @@ struct Chunk {
     std::vector<Word> words;
 };
 
-/// Chunk boundaries at the longest VAD pause near every kChunkTarget seconds.
-std::vector<Chunk> planChunks(double duration, const std::vector<Interval>& speech) {
+/// Chunk boundaries at the longest VAD pause near every `target` seconds.
+std::vector<Chunk> planChunks(double duration, const std::vector<Interval>& speech, double target) {
     std::vector<Chunk> chunks;
     double start = 0;
-    while (duration - start > kChunkTarget + 60) {
-        double lo = start + kChunkTarget - 60, hi = start + kChunkTarget + 30;
-        double bestLen = -1, bestCut = start + kChunkTarget;
+    const double slackBefore = std::min(60.0, target * 0.2), slackAfter = std::min(30.0, target * 0.1);
+    while (duration - start > target + slackBefore) {
+        double lo = start + target - slackBefore, hi = start + target + slackAfter;
+        double bestLen = -1, bestCut = start + target;
         for (size_t i = 0; i + 1 < speech.size(); ++i) {
             double gs = speech[i].end, ge = speech[i + 1].start;
             double mid = (gs + ge) / 2;
@@ -117,7 +116,7 @@ std::string hashFile(const std::string& path) {
     return s;
 }
 
-Engine* Engine::create(const std::string& whisperModelPath, const std::string& vadModelPath) {
+Engine* Engine::create(const std::string& asrModelId, const std::string& asrModelPath, const std::string& vadModelPath) {
     setWhisperLogging(false);
     std::unique_ptr<Engine> e(new Engine());
     std::string err;
@@ -126,7 +125,7 @@ Engine* Engine::create(const std::string& whisperModelPath, const std::string& v
         gCreateError = err;
         return nullptr;
     }
-    e->asr_ = makeWhisperTurboBackend(whisperModelPath, WhisperOptions{}, err);
+    e->asr_ = makeAsrBackend(asrModelId, asrModelPath, err);
     if (!e->asr_) {
         gCreateError = err;
         return nullptr;
@@ -139,6 +138,8 @@ void Engine::destroy(Engine* e) { delete e; }
 Engine::~Engine() = default;
 
 std::string Engine::modelName() const { return asr_ ? asr_->modelName() : ""; }
+std::string Engine::modelId() const { return asr_ ? asr_->modelId() : ""; }
+std::string Engine::modelLicense() const { return asr_ ? asr_->modelLicense() : ""; }
 
 bool Engine::loadDictionaryFile(const std::string& path, std::string& error) {
     std::lock_guard<std::mutex> lock(dictMutex_);
@@ -165,6 +166,24 @@ void Engine::clearCache(const std::string& cacheDir, const std::string& cacheKey
 
 FileResult Engine::processFile(const std::string& audioPath, const float* pcm, size_t n, const std::string& cacheDir,
                                const CutOptions& cut, bool lowercaseAll) {
+    // C++ exceptions must not unwind into Swift (that aborts the process); report them as a failed file
+    try {
+        return processFileImpl(audioPath, pcm, n, cacheDir, cut, lowercaseAll);
+    } catch (const std::exception& e) {
+        FileResult r;
+        r.error = std::string("internal error: ") + e.what();
+        stage_.store(static_cast<int>(Stage::failed));
+        return r;
+    } catch (...) {
+        FileResult r;
+        r.error = "internal error";
+        stage_.store(static_cast<int>(Stage::failed));
+        return r;
+    }
+}
+
+FileResult Engine::processFileImpl(const std::string& audioPath, const float* pcm, size_t n,
+                                   const std::string& cacheDir, const CutOptions& cut, bool lowercaseAll) {
     FileResult r;
     cancel_.store(false);
     progress_.store(0);
@@ -178,7 +197,9 @@ FileResult Engine::processFile(const std::string& audioPath, const float* pcm, s
     stage_.store(static_cast<int>(Stage::hashing));
     std::string hash = hashFile(audioPath);
     if (hash.empty()) return fail("cannot read " + audioPath);
-    r.cacheKey = hash + "-" + kCacheVersion;
+    // keyed by content hash + backend/model tag: switching models never reuses another model's transcript
+    const std::string cacheVersion = asr_->cacheTag();
+    r.cacheKey = hash + "-" + cacheVersion;
     std::error_code ec;
     fs::create_directories(cacheDir, ec);
     const std::string cachePath = (fs::path(cacheDir) / (r.cacheKey + ".json")).string();
@@ -193,7 +214,7 @@ FileResult Engine::processFile(const std::string& audioPath, const float* pcm, s
         if (f) {
             try {
                 json j = json::parse(f);
-                if (j.value("samples", 0ull) == n && j.value("version", "") == kCacheVersion) {
+                if (j.value("samples", 0ull) == n && j.value("version", "") == cacheVersion) {
                     for (auto& v : j["vad"]) speech.push_back({v[0].get<double>(), v[1].get<double>()});
                     haveVad = true;
                     for (auto& c : j["chunks"]) {
@@ -214,7 +235,7 @@ FileResult Engine::processFile(const std::string& audioPath, const float* pcm, s
     }
     auto saveCache = [&]() {
         json j;
-        j["version"] = kCacheVersion;
+        j["version"] = cacheVersion;
         j["model"] = modelName();
         j["source"] = fs::path(audioPath).filename().string();
         j["samples"] = n;
@@ -235,11 +256,11 @@ FileResult Engine::processFile(const std::string& audioPath, const float* pcm, s
         std::string err;
         if (!vad_->detect(pcm, n, speech, err)) return fail(err);
         if (cancel_.load()) return fail("cancelled");
-        chunks = planChunks(duration, speech);
+        chunks = planChunks(duration, speech, asr_->chunkSeconds());
         saveCache();
     }
     if (chunks.empty()) {
-        chunks = planChunks(duration, speech);
+        chunks = planChunks(duration, speech, asr_->chunkSeconds());
         saveCache();
     }
     progress_.store(0.05);
@@ -412,6 +433,8 @@ ExportSummary Exporter::finish() {
     j["created"] = isoNow();
     j["generator"] = "TTS Dataset Creator " + opts_.appVersion;
     j["asr_model"] = opts_.modelName;
+    if (!opts_.modelId.empty()) j["asr_model_id"] = opts_.modelId;
+    if (!opts_.modelLicense.empty()) j["asr_model_license"] = opts_.modelLicense;
     j["sample_rate"] = opts_.sampleRate;
     j["channels"] = 1;
     j["sample_format"] = "pcm_s16le";

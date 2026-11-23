@@ -20,6 +20,9 @@ struct TTSDatasetCreatorApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
         }
+        Settings {
+            SettingsView().environmentObject(model)
+        }
     }
 }
 
