@@ -38,6 +38,18 @@ dataset/
 
 The reasoning behind these choices is in `spike/FINDINGS.md`.
 
+## Download
+
+Prebuilt Apple Silicon builds are on the [Releases](https://github.com/ZachB100/tts-dataset-creator/releases) page.
+The `nightly` pre-release is rebuilt by CI on every push to `main`; versioned releases are made by pushing a tag:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+Builds are ad-hoc signed, not notarized: on first launch right-click the app → **Open**, or run
+`xattr -dr com.apple.quarantine "/Applications/TTS Dataset Creator.app"`.
+
 ## Build from source
 
 You need the Xcode **Command Line Tools** (not Xcode) and CMake:
