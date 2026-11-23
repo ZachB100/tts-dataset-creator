@@ -1,0 +1,10 @@
+# Test audio is kept local, not committed
+testdata/**/*
+!testdata/**/
+# build output
+.build/
+build/
+.swiftpm/
+spike/work/
+spike/third_party/
+.DS_Store
